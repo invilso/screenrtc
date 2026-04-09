@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stream</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;background:#000;overflow:hidden;cursor:none}
+  video{width:100vw;height:100vh;object-fit:contain;background:#000}
+  #overlay{
+    position:fixed;top:0;left:0;right:0;
+    padding:10px 14px;
+    background:rgba(0,0,0,.75);
+    color:#0f0;font:13px/1.5 monospace;
+    z-index:10;transition:opacity .4s;
+  }
+  #overlay.hidden{opacity:0;pointer-events:none}
+  #stats{color:#999;margin-top:2px;font-size:12px}
+</style>
+</head>
+<body>
+
+<div id="overlay">
+  <div id="status">Connecting…</div>
+  <div id="stats"></div>
+</div>
+<video id="video" autoplay playsinline muted></video>
+
+<script>
+(() => {
+  'use strict';
+
+  const video   = document.getElementById('video');
+  const overlay = document.getElementById('overlay');
+  const statusE = document.getElementById('status');
+  const statsE  = document.getElementById('stats');
+
+  const WS_URL = `ws://${location.host}/ws`;
+
+  let ws, pc;
+  let reconnectMs = 1000;
+  let hideTimer, cursorTimer, statsTimer;
+  let lastBytes = 0, lastTs = 0;
+
+  // ── WebSocket signaling ────────────────────────────────────────
+
+  function connect() {
+    statusE.textContent = 'Connecting…';
+    showOverlay();
+
+    ws = new WebSocket(WS_URL);
+
+    ws.onopen = () => {
+      statusE.textContent = 'Waiting for stream…';
+      reconnectMs = 1000;
+      createPC();
+    };
+
+    ws.onmessage = async (ev) => {
+      const msg = JSON.parse(ev.data);
+
+      if (msg.type === 'offer') {
+        await pc.setRemoteDescription({type: 'offer', sdp: msg.sdp});
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({type: 'answer', sdp: answer.sdp}));
+      }
+      else if (msg.type === 'ice' && msg.candidate) {
+        await pc.addIceCandidate({
+          candidate:    msg.candidate,
+          sdpMLineIndex: msg.sdpMLineIndex,
+        });
+      }
+    };
+
+    ws.onclose = () => {
+      statusE.textContent = `Disconnected — retry in ${(reconnectMs/1000).toFixed(0)}s`;
+      showOverlay();
+      cleanup();
+      setTimeout(connect, reconnectMs);
+      reconnectMs = Math.min(reconnectMs * 1.5, 10000);
+    };
+
+    ws.onerror = () => ws.close();
+  }
+
+  // ── WebRTC ─────────────────────────────────────────────────────
+
+  function createPC() {
+    cleanup();
+
+    pc = new RTCPeerConnection({
+      // Local 5 GHz LAN — host candidates are enough, no STUN needed
+      iceServers: [],
+    });
+
+    // We only receive video
+    pc.addTransceiver('video', {direction: 'recvonly'});
+
+    pc.ontrack = (ev) => {
+      statusE.textContent = 'Streaming';
+      video.srcObject = ev.streams[0];
+      video.play().catch(() => {});
+      scheduleHide(3000);
+      startStats();
+
+      // Minimize receiver-side buffering for LAN low-latency
+      const recv = ev.receiver;
+      if (recv) {
+        recv.playoutDelayHint = 0;
+        if (recv.jitterBufferTarget !== undefined) recv.jitterBufferTarget = 0;
+      }
+    };
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'ice',
+          candidate:     ev.candidate.candidate,
+          sdpMLineIndex: ev.candidate.sdpMLineIndex,
+        }));
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      const s = pc.iceConnectionState;
+      if (s === 'failed' || s === 'disconnected') {
+        statusE.textContent = 'ICE ' + s;
+        showOverlay();
+      }
+    };
+  }
+
+  function cleanup() {
+    if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+    if (pc) { pc.close(); pc = null; }
+    lastBytes = 0; lastTs = 0;
+  }
+
+  // ── Live stats ─────────────────────────────────────────────────
+
+  function startStats() {
+    if (statsTimer) clearInterval(statsTimer);
+    statsTimer = setInterval(async () => {
+      if (!pc) return;
+      const reports = await pc.getStats();
+      let line = '';
+
+      reports.forEach(r => {
+        if (r.type === 'inbound-rtp' && r.kind === 'video') {
+          const now   = r.timestamp;
+          const bytes = r.bytesReceived || 0;
+          const dt    = (now - lastTs) / 1000;
+          const kbps  = dt > 0 ? Math.round((bytes - lastBytes) * 8 / dt / 1000) : 0;
+          lastBytes = bytes;
+          lastTs    = now;
+
+          const fps     = r.framesPerSecond || 0;
+          const lost    = r.packetsLost || 0;
+          const dropped = r.framesDropped || 0;
+          const jitter  = r.jitter != null ? (r.jitter * 1000).toFixed(1) : '—';
+
+          line = `${kbps} kbps · ${fps} fps · jitter ${jitter} ms · lost ${lost} · dropped ${dropped}`;
+        }
+        if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.currentRoundTripTime != null) {
+          line += ` · RTT ${(r.currentRoundTripTime * 1000).toFixed(0)} ms`;
+        }
+      });
+
+      if (line) statsE.textContent = line;
+    }, 1000);
+  }
+
+  // ── Overlay / fullscreen ───────────────────────────────────────
+
+  function showOverlay()  { overlay.classList.remove('hidden'); clearTimeout(hideTimer); }
+  function scheduleHide(ms) { clearTimeout(hideTimer); hideTimer = setTimeout(() => overlay.classList.add('hidden'), ms); }
+
+  video.addEventListener('click', () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'f' || e.key === 'F') video.click();
+    if (e.key === 'i' || e.key === 'I') overlay.classList.toggle('hidden');
+  });
+
+  document.addEventListener('mousemove', () => {
+    document.body.style.cursor = 'default';
+    showOverlay();
+    scheduleHide(3000);
+    clearTimeout(cursorTimer);
+    cursorTimer = setTimeout(() => { document.body.style.cursor = 'none'; }, 3000);
+  });
+
+  // ── Go ─────────────────────────────────────────────────────────
+  connect();
+})();
+</script>
+</body>
+</html>

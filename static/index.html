@@ -134,6 +134,10 @@
 
   function cleanup() {
     if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach(t => t.stop());
+      video.srcObject = null;
+    }
     if (pc) { pc.close(); pc = null; }
     lastBytes = 0; lastTs = 0;
   }

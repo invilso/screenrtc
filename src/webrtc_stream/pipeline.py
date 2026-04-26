@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import gi
@@ -99,9 +101,20 @@ class Pipeline:
 
     def stop(self) -> None:
         if self.pipe:
+            bus = self.pipe.get_bus()
+            if bus:
+                bus.remove_signal_watch()
             self.pipe.set_state(Gst.State.NULL)
+            self.pipe.get_state(Gst.CLOCK_TIME_NONE)
             self.pipe = None
             self.webrtc = None
+
+    def close_capture(self) -> None:
+        """Close the portal PipeWire fd if open."""
+        if self._capture:
+            with contextlib.suppress(OSError):
+                os.close(self._capture.fd)
+            self._capture = None
 
     # ── source element ───────────────────────────────────────────────
 
@@ -139,17 +152,20 @@ class Pipeline:
         self.webrtc.emit("create-offer", None, promise)
 
     def _on_offer_created(self, promise: Gst.Promise) -> None:
-        promise.wait()
-        reply = promise.get_reply()
-        offer = reply.get_value("offer")
+        try:
+            promise.wait()
+            reply = promise.get_reply()
+            offer = reply.get_value("offer")
 
-        p = Gst.Promise.new()
-        self.webrtc.emit("set-local-description", offer, p)
-        p.interrupt()
+            p = Gst.Promise.new()
+            self.webrtc.emit("set-local-description", offer, p)
+            p.interrupt()
 
-        sdp_text = offer.sdp.as_text()
-        LOG.info("Offer ready (%d bytes)", len(sdp_text))
-        self._ws_send({"type": "offer", "sdp": sdp_text})
+            sdp_text = offer.sdp.as_text()
+            LOG.info("Offer ready (%d bytes)", len(sdp_text))
+            self._ws_send({"type": "offer", "sdp": sdp_text})
+        except Exception:
+            LOG.exception("Failed to create offer")
 
     def _on_ice_candidate(self, _element: Gst.Element, mline_index: int, candidate: str) -> None:
         self._ws_send(

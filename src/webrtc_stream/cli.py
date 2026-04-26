@@ -156,11 +156,14 @@ def main() -> None:
 
     # GLib main-loop in a background thread (drives GStreamer signals)
     glib_loop = GLib.MainLoop()
-    threading.Thread(target=glib_loop.run, daemon=True).start()
+    glib_thread = threading.Thread(target=glib_loop.run, daemon=True)
+    glib_thread.start()
 
     server = SignalingServer(pipeline, config.host, config.port)
     try:
         server.run()
     finally:
         GLib.idle_add(pipeline.stop)
-        glib_loop.quit()
+        GLib.idle_add(glib_loop.quit)
+        glib_thread.join(timeout=2.0)
+        pipeline.close_capture()

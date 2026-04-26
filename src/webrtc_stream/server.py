@@ -39,24 +39,30 @@ class SignalingServer:
             self._pipeline.start()
             return False
 
-        GLib.idle_add(_restart)
+        try:
+            GLib.idle_add(_restart)
 
-        async for msg in ws:
-            if msg.type == web.WSMsgType.TEXT:
-                data = json.loads(msg.data)
-                kind = data.get("type")
-                if kind == "answer":
-                    GLib.idle_add(self._pipeline.handle_answer, data["sdp"])
-                elif kind == "ice" and data.get("candidate"):
-                    GLib.idle_add(
-                        self._pipeline.handle_ice,
-                        data["sdpMLineIndex"],
-                        data["candidate"],
-                    )
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                    except (json.JSONDecodeError, ValueError):
+                        LOG.warning("Invalid JSON from client")
+                        continue
+                    kind = data.get("type")
+                    if kind == "answer" and "sdp" in data:
+                        GLib.idle_add(self._pipeline.handle_answer, data["sdp"])
+                    elif kind == "ice" and data.get("candidate"):
+                        GLib.idle_add(
+                            self._pipeline.handle_ice,
+                            data.get("sdpMLineIndex", 0),
+                            data["candidate"],
+                        )
+        finally:
+            LOG.info("Client disconnected")
+            GLib.idle_add(self._pipeline.stop)
+            self._pipeline.bind(None, None)
 
-        LOG.info("Client disconnected")
-        GLib.idle_add(self._pipeline.stop)
-        self._pipeline.bind(None, None)
         return ws
 
     def run(self) -> None:
